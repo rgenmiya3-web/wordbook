@@ -148,7 +148,7 @@ nav button.on{color:var(--accent); font-weight:700;}
       <textarea id="impText" placeholder='{"words":[...]} または [...]'></textarea>
       <div class="actions"><button id="impBtn" class="primary">読み込む</button></div>
     </div>
-    <div class="small mt" style="text-align:center">意味の取得:Free Dictionary API / 日本語訳の提案:MyMemory</div>
+    <div class="small mt" style="text-align:center">意味の取得:Free Dictionary API(予備:Wiktionary) / 日本語訳の提案:MyMemory</div>
   </section>
 </div>
 
@@ -236,11 +236,26 @@ function delWord(id) {
   persistLocal(); renderAll();
 }
 
-/* ---------- lookup (Free Dictionary API) ---------- */
-async function lookup(word) {
-  const res = await fetch('https://api.dictionaryapi.dev/api/v2/entries/en/' + encodeURIComponent(word.toLowerCase()));
+/* ---------- lookup (Free Dictionary API → Wiktionary fallback) ---------- */
+function fetchWithTimeout(url, ms = 7000) {
+  // AbortController を使わない方式(中継環境でも動くように)
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error('時間切れ')), ms);
+    fetch(url).then(
+      r => { clearTimeout(t); resolve(r); },
+      e => { clearTimeout(t); reject(e); }
+    );
+  });
+}
+function stripHtml(s) {
+  const d = new DOMParser().parseFromString(String(s || ''), 'text/html');
+  return (d.body.textContent || '').replace(/\s+/g, ' ').trim();
+}
+
+async function lookupFreeDict(word) {
+  const res = await fetchWithTimeout('https://api.dictionaryapi.dev/api/v2/entries/en/' + encodeURIComponent(word.toLowerCase()));
   if (res.status === 404) return { notFound: true };
-  if (!res.ok) throw new Error('http ' + res.status);
+  if (!res.ok) throw new Error('辞書A: HTTP ' + res.status);
   const data = await res.json();
   const entries = Array.isArray(data) ? data : [];
   if (!entries.length) return { notFound: true };
@@ -258,6 +273,43 @@ async function lookup(word) {
     }
   }
   return { headword: e0.word || word, ipa, meanings: meanings.slice(0, 5) };
+}
+
+async function lookupWiktionary(word) {
+  const res = await fetchWithTimeout('https://en.wiktionary.org/api/rest_v1/page/definition/' + encodeURIComponent(word.toLowerCase()));
+  if (res.status === 404) return { notFound: true };
+  if (!res.ok) throw new Error('辞書B: HTTP ' + res.status);
+  const data = await res.json();
+  const secs = Array.isArray(data && data.en) ? data.en : [];
+  if (!secs.length) return { notFound: true };
+  const meanings = [];
+  for (const sec of secs) {
+    const pos = (sec.partOfSpeech || '').toLowerCase();
+    for (const d of (sec.definitions || []).slice(0, 2)) {
+      const def = stripHtml(d.definition);
+      if (!def) continue;
+      const raw = (d.parsedExamples && d.parsedExamples[0] && d.parsedExamples[0].example) || (d.examples && d.examples[0]) || '';
+      meanings.push({ pos, def, ex: stripHtml(raw) });
+    }
+  }
+  if (!meanings.length) return { notFound: true };
+  return { headword: word, ipa: '', meanings: meanings.slice(0, 5) };
+}
+
+async function lookup(word) {
+  const errs = [];
+  let missing = 0;
+  for (const fn of [lookupFreeDict, lookupWiktionary]) {
+    try {
+      const r = await fn(word);
+      if (!r.notFound) return r;
+      missing++;
+    } catch (e) {
+      errs.push((e && e.message) || String(e));
+    }
+  }
+  if (missing === 0 && errs.length) throw new Error(errs.join(' / '));
+  return { notFound: true };
 }
 
 async function suggestJa(word, apply, btn) {
@@ -296,7 +348,7 @@ async function onLookup() {
       openEditor({ isNew: true, word: r.headword, ipa: r.ipa, meanings: r.meanings.length ? r.meanings : [blankMeaning()], context: '', note: '' });
     }
   } catch (e) {
-    setStatus('取得できませんでした。通信状況を確認するか、「手動で追加」を使ってください。');
+    setStatus('取得できませんでした(' + ((e && e.message) || '原因不明') + ')。通信状況を確認するか、「手動で追加」を使ってください。');
   } finally {
     $('#addBtn').disabled = false;
   }
